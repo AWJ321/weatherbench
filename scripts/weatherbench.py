@@ -1402,7 +1402,7 @@ def plot_dynamic(model_keys, add_configs, period, outname):
                 if second_mask[i][j, k]:
                     ax.add_patch(Rectangle((xl+0.08, 0.08), 0.83, 0.83, fill=False, edgecolor="blue", linewidth=1.5))
             if i == 0:
-                title = "HKE Spectrum RMSE\n(200/700/850 hPa avg)" if j == len(DYN_VARS) else \
+                title = "HKE Spectrum NRMSE\n(200/700/850 hPa avg)" if j == len(DYN_VARS) else \
                          "6-hourly Acc. Precip.\nFSS Score" if j == precip_row else \
                          DYN_DISPLAY[DYN_VARS[j]] + " NRMSE"
                 ax.set_title(title, fontsize=9, pad=10)
