@@ -1144,33 +1144,73 @@ def ensure_era5_spectra_cached(pl_truth):
                 continue
     return cache_dir
 
-def get_spectra_data(model_key, period, add_configs):
-    suffix = PERIOD_CHOICES[period]
-    if model_key in PRECOMPUTED_MODELS:
-        path = NPZ_DIR / f"era5_vs_{model_key}_combined_{suffix}.npz"
-        if not path.exists():
-            print(f"MISSING: {path}")
-            return {lt: np.nan for lt in LEADS}
-        d = np.load(path, allow_pickle=True)
-        spectra = {int(k): float(v) for k, v in d["spectra"].item().items()}
-        return {lt: spectra.get(lt, np.nan) for lt in LEADS}
+def compute_spectra_reference(pl_truth):
+    truth_files = glob_truth_files_by_template(pl_truth.dir, pl_truth.filename_template)
+    print(f"Computing Spectra (HKE) reference values over {len(truth_files)} truth files...")
+    sums = {level: 0.0 for level in SPECTRA_PRESSURES}
+    counts = {level: 0 for level in SPECTRA_PRESSURES}
+    for f in truth_files:
+        try:
+            ds = clip_domain(open_truth_file(f))
+        except Exception:
+            continue
+        for level in SPECTRA_PRESSURES:
+            try:
+                u = get_truth_var(ds, "u", pl_truth, level=level)
+                v = get_truth_var(ds, "v", pl_truth, level=level)
+                hke = compute_hke(u, v)
+                valid = hke[~np.isnan(hke)]
+                sums[level] += valid.sum(); counts[level] += valid.size
+            except Exception:
+                continue
+    return {level: (sums[level] / counts[level] if counts[level] else np.nan) for level in SPECTRA_PRESSURES}
 
-    config = add_configs[model_key]
+def get_spectra_reference_values(pl_truth):
+    if pl_truth is None:
+        path = REF_DIR / "era5_spectra_truth_mean.npz"
+        if not path.exists():
+            raise FileNotFoundError("Default Spectra reference values not found -- run setup first.")
+        return np.load(path, allow_pickle=True)["truth_mean"].item()
+
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", pl_truth.dir).strip("_")
+    path = REF_DIR / f"era5_spectra_truth_mean_{safe_name}.npz"
+    if path.exists():
+        print(f"  Using cached Spectra reference values -> {path}")
+        return np.load(path, allow_pickle=True)["truth_mean"].item()
+
+    ref = compute_spectra_reference(pl_truth)
+    REF_DIR.mkdir(exist_ok=True)
+    np.savez(path, truth_mean=ref)
+    print(f"  Saved new Spectra reference values -> {path}")
+    return ref
+
+def _compute_one_spectrum(args):
+    fpath, level, era5_path, config = args
+    try:
+        model_rad = compute_spectrum_for_file(fpath, level, config)
+        era5_rad = np.load(era5_path)["H_rad"].astype(np.float64)
+        return model_rad, era5_rad
+    except Exception:
+        return None
+
+def compute_spectra_for_model(config, period):
+    """Live compute. Caches RAW (unnormalized) per-lead, per-level RMSE as
+    'spectra_by_level_raw' into era5_vs_{config.name}_combined_{period}.npz.
+    Normalization (division by log10(ref[level]) per level, then averaged
+    across levels) happens at READ time in get_spectra_data /
+    get_spectra_data_by_level -- matching the Traditional/Dynamic convention,
+    so the reference can be recomputed later without redoing this expensive
+    per-file FFT computation."""
+    suffix = PERIOD_CHOICES[period]
     pl_truth = resolve_pl_truth(config)
-    out_path = NPZ_DIR / f"era5_vs_{model_key}_combined_{suffix}.npz"
-    if out_path.exists():
-        d = np.load(out_path, allow_pickle=True)
-        if "spectra" in d:
-            print(f"  Using cached spectra for {config.name} ({period}) -> {out_path}")
-            spectra = {int(k): float(v) for k, v in d["spectra"].item().items()}
-            return {lt: spectra.get(lt, np.nan) for lt in LEADS}
+    out_path = NPZ_DIR / f"era5_vs_{config.name}_combined_{suffix}.npz"
 
     era5_cache = ensure_era5_spectra_cached(pl_truth)
     regex = build_filename_regex(config.filename_template)
     all_files = sorted(Path(config.forecast_dir).glob("*"))
     mode, season = suffix_to_mode_season(suffix)
 
-    sums, era5_sums, counts = {}, {}, {}
+    jobs = []
     for f in all_files:
         m = regex.match(f.name)
         if not m: continue
@@ -1183,42 +1223,107 @@ def get_spectra_data(model_key, period, add_configs):
             if valid_time.strftime("%Y-%m-%d_%H") not in TWELVE_CASE_DATES: continue
         elif mode == "monsoon":
             if valid_time.month not in MONSOON_PERIODS[season]: continue
-
         for level in SPECTRA_PRESSURES:
             era5_path = era5_cache / f"HKE_era5_{valid_time.strftime('%Y-%m-%d_%H')}_{level}.npz"
             if not era5_path.exists(): continue
-            try:
-                model_rad = compute_spectrum_for_file(f, level, config)
-                era5_rad = np.load(era5_path)["H_rad"].astype(np.float64)
-                key = (lead, level)
-                if key not in sums:
-                    sums[key] = np.zeros_like(model_rad); era5_sums[key] = np.zeros_like(era5_rad); counts[key] = 0
-                sums[key] += model_rad; era5_sums[key] += era5_rad; counts[key] += 1
-            except Exception:
-                continue
+            jobs.append(((lead, level), f, level, era5_path))
+
+    print(f"  {config.name} ({period}): {len(jobs)} (file, level) pairs to compute")
+    sums, era5_sums, counts = {}, {}, {}
+    with ProcessPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_compute_one_spectrum, (fpath, level, era5_path, config)): key
+                for key, fpath, level, era5_path in jobs}
+        for fut in as_completed(futs):
+            key = futs[fut]
+            res = fut.result()
+            if res is None: continue
+            model_rad, era5_rad = res
+            if key not in sums:
+                sums[key] = np.zeros_like(model_rad); era5_sums[key] = np.zeros_like(era5_rad); counts[key] = 0
+            sums[key] += model_rad; era5_sums[key] += era5_rad; counts[key] += 1
 
     print(f"  Spectra computed for {config.name} ({period})")
-    results = {}
+    by_level_raw = {}
     for lt in LEADS:
-        level_rmses = []
+        level_raw = {}
         for level in SPECTRA_PRESSURES:
             key = (lt, level)
             n = counts.get(key, 0)
             if n == 0: continue
             model_mean = sums[key] / n
             era5_mean = era5_sums[key] / n
-            level_rmses.append(float(np.sqrt(np.mean((np.log(era5_mean) - np.log(model_mean)) ** 2))))
-        results[lt] = float(np.mean(level_rmses)) if level_rmses else np.nan
+            level_raw[level] = float(np.sqrt(np.mean((np.log(era5_mean) - np.log(model_mean)) ** 2)))
+        by_level_raw[lt] = level_raw
 
     existing = {}
     if out_path.exists():
         d = np.load(out_path, allow_pickle=True)
         existing = {k: d[k].item() for k in d.files}
-    existing["spectra"] = results
+    existing["spectra_by_level_raw"] = by_level_raw
     NPZ_DIR.mkdir(exist_ok=True)
     np.savez(out_path, **existing)
     print(f"  Saved -> {out_path}")
-    return results
+    return by_level_raw
+
+
+def _normalize_spectra_by_level(by_level_raw, ref):
+    return {lt: {level: raw / np.log10(ref[level]) for level, raw in levels.items()}
+            for lt, levels in by_level_raw.items()}
+
+
+def get_spectra_data_by_level(model_key, period, add_configs=None):
+    suffix = PERIOD_CHOICES[period]
+    path = NPZ_DIR / f"era5_vs_{model_key}_combined_{suffix}.npz"
+    if not path.exists():
+        print(f"MISSING: {path}")
+        return {lt: {lvl: np.nan for lvl in SPECTRA_PRESSURES} for lt in LEADS}
+    d = np.load(path, allow_pickle=True)
+    if "spectra_by_level_raw" not in d:
+        raise KeyError(f"{path} has no 'spectra_by_level_raw' yet -- regenerate this model's spectra first.")
+    raw = {int(lt): {int(lvl): float(v) for lvl, v in levels.items()}
+           for lt, levels in d["spectra_by_level_raw"].item().items()}
+    if model_key in PRECOMPUTED_MODELS:
+        ref = get_spectra_reference_values(None)
+    else:
+        config = add_configs[model_key]
+        ref = get_spectra_reference_values(resolve_pl_truth(config))
+    return _normalize_spectra_by_level(raw, ref)
+
+
+def get_spectra_data(model_key, period, add_configs):
+    suffix = PERIOD_CHOICES[period]
+    if model_key in PRECOMPUTED_MODELS:
+        path = NPZ_DIR / f"era5_vs_{model_key}_combined_{suffix}.npz"
+        if not path.exists():
+            print(f"MISSING: {path}")
+            return {lt: np.nan for lt in LEADS}
+        d = np.load(path, allow_pickle=True)
+        if "spectra_by_level_raw" not in d:
+            print(f"MISSING spectra_by_level_raw in: {path}")
+            return {lt: np.nan for lt in LEADS}
+        raw = {int(lt): {int(lvl): float(v) for lvl, v in levels.items()}
+               for lt, levels in d["spectra_by_level_raw"].item().items()}
+        ref = get_spectra_reference_values(None)
+        by_level = _normalize_spectra_by_level(raw, ref)
+        return {lt: (float(np.mean(list(levels.values()))) if levels else np.nan) for lt, levels in by_level.items()}
+
+    config = add_configs[model_key]
+    pl_truth = resolve_pl_truth(config)
+    out_path = NPZ_DIR / f"era5_vs_{model_key}_combined_{suffix}.npz"
+    ref = get_spectra_reference_values(pl_truth)
+
+    if out_path.exists():
+        d = np.load(out_path, allow_pickle=True)
+        if "spectra_by_level_raw" in d:
+            print(f"  Using cached spectra for {config.name} ({period}) -> {out_path}")
+            raw = {int(lt): {int(lvl): float(v) for lvl, v in levels.items()}
+                   for lt, levels in d["spectra_by_level_raw"].item().items()}
+            by_level = _normalize_spectra_by_level(raw, ref)
+            return {lt: (float(np.mean(list(levels.values()))) if levels else np.nan) for lt, levels in by_level.items()}
+
+    by_level_raw = compute_spectra_for_model(config, period)
+    by_level = _normalize_spectra_by_level(by_level_raw, ref)
+    return {lt: (float(np.mean(list(levels.values()))) if levels else np.nan) for lt, levels in by_level.items()}
 
 def plot_dynamic(model_keys, add_configs, period, outname):
     suffix = PERIOD_CHOICES[period]

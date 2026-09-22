@@ -23,3 +23,5 @@ __pycache__/
 *.pyo
 # OS
 .DS_Store
+logs/
+scripts/regenerate_spectra_*
