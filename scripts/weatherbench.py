@@ -939,7 +939,7 @@ from scores.spatial import fss_2d_single_field
 PRECIP_DOMAIN = {"lat_min": -12, "lat_max": 23, "lon_min": 92, "lon_max": 127}
 PRECIP_THRESHOLDS = [5, 10, 20, 50]
 KM_PER_DEGREE = 111.2
-DEFAULT_PRECIP_WINDOWS_GRIDPTS = [2, 5, 10, 20]
+DEFAULT_PRECIP_WINDOWS_GRIDPTS = [1]
 DEFAULT_PRECIP_RESOLUTION_DEG = 0.25
 
 def km_to_gridpoints(km, grid_spacing_deg):
@@ -1146,24 +1146,20 @@ def ensure_era5_spectra_cached(pl_truth):
 
 def compute_spectra_reference(pl_truth):
     truth_files = glob_truth_files_by_template(pl_truth.dir, pl_truth.filename_template)
+    era5_cache = ensure_era5_spectra_cached(pl_truth)
     print(f"Computing Spectra (HKE) reference values over {len(truth_files)} truth files...")
-    sums = {level: 0.0 for level in SPECTRA_PRESSURES}
+    sums = {level: None for level in SPECTRA_PRESSURES}
     counts = {level: 0 for level in SPECTRA_PRESSURES}
-    for f in truth_files:
-        try:
-            ds = clip_domain(open_truth_file(f))
-        except Exception:
-            continue
+    for tf in truth_files:
+        valid_str = parse_truth_datetime(tf.name).strftime("%Y-%m-%d_%H")
         for level in SPECTRA_PRESSURES:
-            try:
-                u = get_truth_var(ds, "u", pl_truth, level=level)
-                v = get_truth_var(ds, "v", pl_truth, level=level)
-                hke = compute_hke(u, v)
-                valid = hke[~np.isnan(hke)]
-                sums[level] += valid.sum(); counts[level] += valid.size
-            except Exception:
-                continue
-    return {level: (sums[level] / counts[level] if counts[level] else np.nan) for level in SPECTRA_PRESSURES}
+            era5_path = era5_cache / f"HKE_era5_{valid_str}_{level}.npz"
+            if not era5_path.exists(): continue
+            H_rad = np.load(era5_path)["H_rad"].astype(np.float64)
+            sums[level] = H_rad if sums[level] is None else sums[level] + H_rad
+            counts[level] += 1
+    return {level: (float(np.mean(sums[level] / counts[level])) if counts[level] else np.nan)
+            for level in SPECTRA_PRESSURES}
 
 def get_spectra_reference_values(pl_truth):
     if pl_truth is None:
@@ -1252,7 +1248,7 @@ def compute_spectra_for_model(config, period):
             if n == 0: continue
             model_mean = sums[key] / n
             era5_mean = era5_sums[key] / n
-            level_raw[level] = float(np.sqrt(np.mean((np.log(era5_mean) - np.log(model_mean)) ** 2)))
+            level_raw[level] = float(np.sqrt(np.mean((era5_mean - model_mean) ** 2)))
         by_level_raw[lt] = level_raw
 
     existing = {}
@@ -1267,7 +1263,7 @@ def compute_spectra_for_model(config, period):
 
 
 def _normalize_spectra_by_level(by_level_raw, ref):
-    return {lt: {level: raw / np.log10(ref[level]) for level, raw in levels.items()}
+    return {lt: {level: raw / ref[level] for level, raw in levels.items()}
             for lt, levels in by_level_raw.items()}
 
 
@@ -1341,11 +1337,13 @@ def plot_dynamic(model_keys, add_configs, period, outname):
 
     all_matrices = [matrices[m] for m in model_keys]
     n_rows, n_vars = len(model_keys), len(COLUMN_ORDER)
+    spectra_row = len(DYN_VARS)
     precip_row = len(DYN_VARS) + 1
 
-    all_non_precip = [x for m in model_keys for row_idx in range(precip_row) for x in matrices[m][row_idx] if not np.isnan(x)]
+    all_non_precip = [x for m in model_keys for row_idx in range(spectra_row) for x in matrices[m][row_idx] if not np.isnan(x)]
     global_scale = max(all_non_precip) if all_non_precip else 1.0
     for m in model_keys:
+        matrices[m][spectra_row] = [x * global_scale if not np.isnan(x) else x for x in matrices[m][spectra_row]]
         matrices[m][precip_row] = [x * global_scale if not np.isnan(x) else x for x in matrices[m][precip_row]]
 
     best_mask = [np.zeros_like(m, dtype=bool) for m in all_matrices]
@@ -1402,8 +1400,8 @@ def plot_dynamic(model_keys, add_configs, period, outname):
                 if second_mask[i][j, k]:
                     ax.add_patch(Rectangle((xl+0.08, 0.08), 0.83, 0.83, fill=False, edgecolor="blue", linewidth=1.5))
             if i == 0:
-                title = "HKE Spectrum NRMSE\n(200/700/850 hPa avg)" if j == len(DYN_VARS) else \
-                         "6-hourly Acc. Precip.\nFSS Score" if j == precip_row else \
+                title = "HKE Spectrum NRMSE\n(scaled, 200/700/850 avg)" if j == spectra_row else \
+                         "6-hourly Acc. Precip.\nFSS Score (scaled)" if j == precip_row else \
                          DYN_DISPLAY[DYN_VARS[j]] + " NRMSE"
                 ax.set_title(title, fontsize=9, pad=10)
             if i == n_rows - 1:
@@ -1435,10 +1433,10 @@ def plot_dynamic(model_keys, add_configs, period, outname):
 # COMBINED MODE
 # ============================================================
 def compute_combined_scores(model_keys, period, add_configs):
-    """Traditional's 4 + Dynamic's 4 + Spectra, unweighted-averaged with
-    precip scaled by a global_scale computed independently per period
-    (max of all non-precip values across all models THIS period) --
-    matches the original manuscript combined-score convention exactly."""
+    """Traditional's 4 + Dynamic's 4, unweighted-averaged, with spectra AND
+    precip each scaled by global_scale (max of the base pool: Traditional's 4
+    + Dynamic's 4, excluding spectra and precip) before being folded in --
+    matches the manuscript's approved no-log + spectra-scaled convention."""
     suffix = PERIOD_CHOICES[period]
     all_metrics = {}
     for m in model_keys:
@@ -1451,28 +1449,30 @@ def compute_combined_scores(model_keys, period, add_configs):
             metrics[f"trad_{var}"] = trad[var]
         for var in DYN_VARS:
             metrics[f"dyn_{var}"] = dyn[var]
-        metrics["spectra"] = spectra
-        all_metrics[m] = {"non_precip": metrics, "precip": precip}
+        all_metrics[m] = {"base": metrics, "spectra": spectra, "precip": precip}
 
-    all_non_precip = []
+    all_base = []
     for m in model_keys:
-        for metric, lead_dict in all_metrics[m]["non_precip"].items():
+        for metric, lead_dict in all_metrics[m]["base"].items():
             for lt in LEADS:
                 v = lead_dict.get(lt, np.nan)
                 if not (isinstance(v, float) and np.isnan(v)):
-                    all_non_precip.append(float(v))
-    global_scale = max(all_non_precip) if all_non_precip else 1.0
-    print(f"  [{period}] Global scale (max): {global_scale:.4f}")
+                    all_base.append(float(v))
+    global_scale = max(all_base) if all_base else 1.0
+    print(f"  [{period}] Global scale (base pool, spectra+precip excluded): {global_scale:.4f}")
 
     scores = {}
     for m in model_keys:
         scores[m] = {}
         for lt in LEADS:
             vals = []
-            for metric, lead_dict in all_metrics[m]["non_precip"].items():
+            for metric, lead_dict in all_metrics[m]["base"].items():
                 v = lead_dict.get(lt, np.nan)
                 if not (isinstance(v, float) and np.isnan(v)):
                     vals.append(float(v))
+            spectra_v = all_metrics[m]["spectra"].get(lt, np.nan)
+            if not (isinstance(spectra_v, float) and np.isnan(spectra_v)):
+                vals.append(spectra_v * global_scale)
             precip_v = all_metrics[m]["precip"].get(lt, np.nan)
             if not (isinstance(precip_v, float) and np.isnan(precip_v)):
                 vals.append(precip_v * global_scale)
