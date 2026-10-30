@@ -98,7 +98,7 @@ PRECOMPUTED_PRECIP_TRUTH_LABEL = "GPM"
 MODEL_DISPLAY = {"pangu": "PanguWeather", "fourcastnet": "FourcastNet", "aifs": "AIFS",
                   "graphcast": "Graphcast", "aurora": "Aurora"}
 
-DOMAIN = {"lat_min": -10, "lat_max": 25, "lon_min": 90, "lon_max": 140}
+DOMAIN = {"lat_min": -12, "lat_max": 23, "lon_min": 92, "lon_max": 127}
 LEAD_TIMES = [6, 12, 18, 24, 30, 36, 42, 48]
 LEADS = [12, 24, 36, 48]
 GRAVITY = 9.80665
@@ -466,9 +466,9 @@ def compute_truth_reference(pl_truth):
             valid = vals[~np.isnan(vals)]
             sums[var] += valid.sum(); counts[var] += valid.size
         if "u" in pl_truth.variables and "v" in pl_truth.variables:
-            mean_u = np.nanmean(get_truth_var(ds, "u", pl_truth, level=850))
-            mean_v = np.nanmean(get_truth_var(ds, "v", pl_truth, level=850))
-            wind_sum += np.sqrt(mean_u**2 + mean_v**2); wind_n += 1
+            u850 = get_truth_var(ds, "u", pl_truth, level=850)
+            v850 = get_truth_var(ds, "v", pl_truth, level=850)
+            wind_sum += np.nanmean(np.sqrt(u850**2 + v850**2)); wind_n += 1
 
     ref = {var: {level: (sums[var]/counts[var] if counts[var] else np.nan)} for var, level in levels.items()}
     ref["wind"] = {850: (wind_sum/wind_n if wind_n else np.nan)}
@@ -848,7 +848,7 @@ def compute_dynamic_reference(pl_truth, sfc_truth):
                 v10 = get_truth_var(truth_sfc, "v10", sfc_truth)
                 t2m = get_truth_var(truth_t2m, "t2m", sfc_truth)
                 energy = compute_t2m_energy(u10, v10, truth_sfc.latitude.values, truth_sfc.longitude.values, t2m)
-                ste_vals.append(abs(np.nanmean(energy)))
+                ste_vals.append(np.nanmean(np.abs(energy)))
             except Exception:
                 continue
 
@@ -943,7 +943,7 @@ def get_dynamic_data(model_key, period, add_configs):
 
 from scores.spatial import fss_2d_single_field
 
-PRECIP_DOMAIN = {"lat_min": -12, "lat_max": 23, "lon_min": 92, "lon_max": 127}
+PRECIP_DOMAIN = DOMAIN
 PRECIP_THRESHOLDS = [5, 10, 20, 50]
 KM_PER_DEGREE = 111.2
 DEFAULT_PRECIP_WINDOWS_GRIDPTS = [1]
@@ -1108,8 +1108,9 @@ def hke_spectrum_2d(hke, lat, lon):
     return H_power, kx, ky
 
 def radial_average_spectrum_2d(H_power, kx, ky):
-    if max(kx) > max(ky): return H_power.mean(axis=1), ky
-    return H_power.mean(axis=0), kx
+    # always average over longitude (kx) and keep the latitude wavenumbers (ky);
+    # the old "if max(kx) > max(ky)" rule switched direction when the box became square
+    return H_power.mean(axis=1), ky
 
 def compute_spectrum_for_file(fpath, level, config):
     ds = clip_domain(open_pl(fpath, config))

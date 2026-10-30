@@ -32,8 +32,8 @@
     }
   },
   "sfc_truth": {
-    "dir": "/data/projects/77010001/ccrs_dwr/nwp/arun/intern_zaloy/era5_reanalysis/era5_2024to2025/era5_sfc_splits_6hr_regridded",
-    "t2m_dir": "/data/projects/77010001/ccrs_dwr/nwp/arun/intern_zaloy/era5_reanalysis/era5_2024to2025/era5_sfc_splits_6hr_t2m_regridded",
+    "dir": "/data/projects/77010001/ccrs_dwr/nwp/wjang/era5_surface_fix/era5_sl_sfc_6hr",
+    "t2m_dir": "/data/projects/77010001/ccrs_dwr/nwp/wjang/era5_surface_fix/era5_sl_sfc_6hr_t2m",
     "variables": {
       "u10": {
         "name": "u10",
@@ -47,7 +47,9 @@
         "name": "t2m",
         "unit": "K"
       }
-    }
+    },
+    "filename_template": "era5_sfc_{date}_{hour}",
+    "t2m_filename_template": "era5_sfc_{date}_{hour}_t2m"
   },
   "precip_truth": {
     "dir": "/data/projects/77010001/ccrs_dwr/nwp/wjang/gpm_unified",
